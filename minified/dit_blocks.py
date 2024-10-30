@@ -111,7 +111,7 @@ class SelfAttention(nn.Module):
         attn_score = func_nn.softmax(attn_weight, dim=1) # calculate softmax (squeeze into range(0, 1))
         attn_output = attn_score @ v # multiply with value vectors
         
-        output = rearrange(output, 'b h n e -> b n (h e)') # fold back to input shape
+        output = rearrange(attn_output, 'b h n e -> b n (h e)') # fold back to input shape
         output = self.dropout(self.output_project(output)) # output projection
         
         return output
@@ -159,7 +159,21 @@ class CrossAttention(nn.Module):
         return output
     
     
-class PointwiseFeedforward(nn.Module):
-    def __init__(self, embed_dim: int):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.
+        self.layernorm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.shift_scale_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
+        self.out_channels = out_channels
+        
+    def forward(self, x, timestep):
+        
+        shift_scale_params = [self.shift_scale_table[None] + timestep[:, None]]
+        shift, scale = shift_scale_params.chunk(2, dim=1)
+        
+        x_modulate = modulate_t2i(self.layernorm(x), shift, scale)
+        
+        x = self.linear(x_modulate)
+        
+        return x

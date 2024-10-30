@@ -2,8 +2,12 @@ import torch, math
 from torch import nn
 from torch.nn import functional as func_nn
 from transformers import AutoTokenizer, T5EncoderModel
+from timm.models.vision_transformer import Mlp, DropPath
 from einops import rearrange
+from typing import TypeAlias
 from minified.utils import config
+
+tensor: TypeAlias = torch.Tensor # alias typing for torch.Tensor
 
 # T5 text encoder
 t5_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
@@ -16,34 +20,62 @@ def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
 
     return last_hidden_states
 
+def modulate_t2i(x, scale, shift):
+    return x * (1 + scale) + shift
+
 
 # DiT block module
 class DitBlock(nn.Module):
     """
     Pixart DiT block [
-        embed - scale/shift - Multi self-attention - scale ->
+        embed/layernorm - scale/shift - Multi self-attention - scale ->
         concat w/input - multi cross-attention -> concat w/attention tokens ->
-        scale/shift - pointwise feedforward -> scale
+        scale/shift - pointwise feedforward -> scale -> concat w/ff_tokens
     
-        MLP for time embedding
+        MLP for time embedding.
     ]
     """
     
-    def __init__(self):
+    def __init__(self, hidden_size=config.hidden_size, mlp_ratio=4.0, drop_rate=0.0):
         super().__init__()
-        self.layernorm = nn.LayerNorm(, eps=1e-6)
-        self.self_attention = None
-        self.cross_attention = None
+        
+        self.layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.self_attention = SelfAttention()
+        self.cross_attention = CrossAttention()
+        
         self.pointwise_feedforward = None
+
+        self.mlp_layer = Mlp(
+            in_features=hidden_size, hidden_features=int(mlp_ratio*hidden_size), 
+            act_layer=nn.GELU(approximate='tanh'), drop=drop_rate
+        )
+        # lookup table 
+        self.shift_scale_params = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        self.drop_path = DropPath(drop_rate)
         
     def _modulate(self, scale, shift):
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         
         return x
+    
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x_input: tensor, y_cond: tensor, timestep):
+        b, l, c = x_input.shape # get noised input shape
         
-        return x
+        # get scale/shift values from table, reshape
+        scale_shift_params = (self.shift_scale_params[None] + timestep.reshape(b, 6, -1)) 
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = scale_shift_params.chunk(6, dim=1) 
+        
+        x_mod = modulate_t2i((self.layernorm(x_input)), shift_msa, scale_msa)
+        x_attn = x_input + self.drop_path(gate_msa * self.self_attention(x_mod))
+        
+        x_crossattn = x_attn + self.cross_attention(x_attn, y_cond).reshape(b, l, c)
+
+        x2 = modulate_t2i(self.layernorm(x_crossattn), shift_mlp, scale_mlp)
+
+        x_mlp = x_crossattn + self.drop_path(gate_mlp * self.mlp_layer(x2))
+                                             
+        return x_mlp
     
     
 # self attention blocks for DiT block
@@ -77,10 +109,10 @@ class SelfAttention(nn.Module):
         # attention computatation
         attn_weight = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # dot product of query/keys, divide by root of head di
         attn_score = func_nn.softmax(attn_weight, dim=1) # calculate softmax (squeeze into range(0, 1))
-        output = attn_score @ v # multiply with value vectors
+        attn_output = attn_score @ v # multiply with value vectors
         
         output = rearrange(output, 'b h n e -> b n (h e)') # fold back to input shape
-        output = self.output_project(output) # output projection
+        output = self.dropout(self.output_project(output)) # output projection
         
         return output
         
@@ -125,3 +157,9 @@ class CrossAttention(nn.Module):
         output = self.output_project(output) # output projection
         
         return output
+    
+    
+class PointwiseFeedforward(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.

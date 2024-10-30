@@ -4,6 +4,7 @@ from timm.models.vision_transformer import PatchEmbed, Mlp
 from .utils import config
 from .dit_blocks import DitBlock, FinalLayer
 
+
 ## full/central Pixart model
 class PixartDit(nn.Module):
     def __init__(
@@ -45,5 +46,42 @@ class PixartDit(nn.Module):
             out_channels=out_channels
         )
 
-    def forward(self, image: torch.Tensor, encoded_text: torch.Tensor) -> torch.Tensor:
-        pass
+    def forward(self, image: torch.Tensor, encoded_text: torch.Tensor, timestep: torch.Tensor, config=config) -> torch.Tensor:
+        x_img, y_text = image.to(config.dtype), encoded_text.to(config.dtype)
+        timestep = timestep.to(config.dtype)
+        pos_embed = self.pos_embed.to(config.dtype)
+        self.height = x_img.shape[-2] // self.patch_size
+        self.width = x_img.shape[-1] // self.patch_size
+        
+
+# embeds tet conditioning vectors, token dropout
+class CaptionEmbedder(nn.Module):
+    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120):
+        self.project = Mlp(in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size, act_layer=act_layer, drop=0)
+        self.register_buffer('y_embedding', nn.Parameter(torch.randn(token_num, in_channels) // in_channels**0.5))
+        self.uncond_prob = uncond_prob
+    
+    # drop labels to enable classifier-free guidance
+    def token_drop(self, caption, force_drop_ids=None):
+        drop_ids = None
+        
+        if force_drop_ids is None:
+            drop_ids = torch.randn(caption.shape[0]).cuda() < self.uncond_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        
+        caption = torch.where(drop_ids[:, None, None, None], self.y_embedding, caption)
+        return caption
+    
+    
+    def forward(self, caption: torch.Tensor, training: bool, force_drop_ids=None):
+        if training:
+            assert caption.shape[2:] == self.y_embedding.shape
+        use_dropout = self.uncond_prob > 0
+        
+        if (training and use_dropout) or (force_drop_ids is not None):
+            caption = self.token_drop(caption, force_drop_ids)
+        
+        caption = self.project(caption)
+        
+        return caption

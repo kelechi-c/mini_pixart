@@ -76,8 +76,8 @@ class DitBlock(nn.Module):
         x_mlp = x_crossattn + self.drop_path(gate_mlp * self.mlp_layer(x2))
                                              
         return x_mlp
-    
-    
+
+
 # self attention blocks for DiT block
 class SelfAttention(nn.Module):
     def __init__(self, n_heads=config.attn_heads, embed_dim=config.embed_dim, drop_rate=0.1):
@@ -115,9 +115,8 @@ class SelfAttention(nn.Module):
         output = self.dropout(self.output_project(output)) # output projection
         
         return output
-        
-        
-        
+
+
 # self attention blocks for DiT block
 class CrossAttention(nn.Module):
     def __init__(self, n_heads=config.attn_heads, embed_dim=config.embed_dim, cross_dim=120, drop_rate=0.1):
@@ -157,8 +156,8 @@ class CrossAttention(nn.Module):
         output = self.output_project(output) # output projection
         
         return output
-    
-    
+
+
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
@@ -166,14 +165,102 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.shift_scale_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
         self.out_channels = out_channels
-        
+
     def forward(self, x, timestep):
-        
+
         shift_scale_params = [self.shift_scale_table[None] + timestep[:, None]]
         shift, scale = shift_scale_params.chunk(2, dim=1)
-        
+
         x_modulate = modulate_t2i(self.layernorm(x), shift, scale)
-        
+
         x = self.linear(x_modulate)
-        
+
         return x
+
+
+# embeds tet conditioning vectors, token dropout
+class CaptionEmbedder(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_size,
+        uncond_prob,
+        act_layer=nn.GELU(approximate="tanh"),
+        token_num=120,
+    ):
+        self.project = Mlp(
+            in_features=in_channels,
+            hidden_features=hidden_size,
+            out_features=hidden_size,
+            act_layer=act_layer,
+            drop=0,
+        )
+        self.register_buffer(
+            "y_embedding",
+            nn.Parameter(torch.randn(token_num, in_channels) // in_channels**0.5),
+        )
+        self.uncond_prob = uncond_prob
+
+    # drop labels to enable classifier-free guidance
+    def token_drop(self, caption, force_drop_ids=None):
+        drop_ids = None
+
+        if force_drop_ids is None:
+            drop_ids = torch.randn(caption.shape[0]).cuda() < self.uncond_prob
+        else:
+            drop_ids = force_drop_ids == 1
+
+        caption = torch.where(drop_ids[:, None, None, None], self.y_embedding, caption)
+        return caption
+
+    def forward(
+        self, caption: torch.Tensor, training: bool = True, force_drop_ids=None
+    ):
+        if training:
+            assert caption.shape[2:] == self.y_embedding.shape
+        use_dropout = self.uncond_prob > 0
+
+        if (training and use_dropout) or (force_drop_ids is not None):
+            caption = self.token_drop(caption, force_drop_ids)
+
+        caption = self.project(caption)
+
+        return caption
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, freq_embed_size=config.freq_embed):
+        super().__init__()
+        self.mlp_layer = nn.Sequential(
+            nn.Linear(freq_embed_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.freq_embed_size = freq_embed_size
+        self.dtype = next(self.parameters()).dtype
+
+    # sinusoidal timestep embeddings
+    @staticmethod
+    def timestep_embed(timestep: tensor, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(
+                start=0, end=half, dtype=torch.float32, device=timestep.device
+            )
+            / half
+        )
+        args = timestep[:, None].float() * freqs[None]
+
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+
+        return embedding
+
+    def forward(self, timestep):
+        time_freq = self.timestep_embed(timestep, self.freq_embed_size).to(self.dtype)
+
+        return self.mlp_layer(time_freq)

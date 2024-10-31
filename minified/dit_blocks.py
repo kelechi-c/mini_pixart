@@ -1,11 +1,15 @@
 import torch, math
 from torch import nn
 from torch.nn import functional as func_nn
+import numpy as np
 from transformers import AutoTokenizer, T5EncoderModel
 from timm.models.vision_transformer import Mlp, DropPath
 from einops import rearrange
 from typing import TypeAlias
 from minified.utils import config
+from collections.abc import Iterable
+from itertools import repeat
+
 
 tensor: TypeAlias = torch.Tensor # alias typing for torch.Tensor
 
@@ -264,3 +268,65 @@ class TimestepEmbedder(nn.Module):
         time_freq = self.timestep_embed(timestep, self.freq_embed_size).to(self.dtype)
 
         return self.mlp_layer(time_freq)
+
+
+def get_1d_sincos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2
+    omega = 1. / 10000 ** omega
+    
+    pos = pos.reshape(-1)
+    out = np.einsum('m,d -> md', pos, omega)
+    
+    sin_embed = np.sin(out)
+    cos_embed = np.cos(out)
+    sincos_embed = np.concatenate([sin_embed, cos_embed], axis=1)
+    
+    return sincos_embed
+
+def get_2d_sincos_embed_from_grid(embed_dim, grid):
+
+    h_embed = get_1d_sincos_embed_from_grid(embed_dim // 2, grid[0])
+    w_embed = get_1d_sincos_embed_from_grid(embed_dim // 2, grid[1])
+
+    sincos_2d = np.concatenate([h_embed, w_embed], axis=1)
+    
+    return sincos_2d
+
+# copied directly from official code
+def _ntuple(n):
+    def parse(x):
+        if isinstance(x, Iterable) and not isinstance(x, str):
+            return x
+        return tuple(repeat(x, n))
+    return parse
+
+
+to_1tuple = _ntuple(1)
+to_2tuple = _ntuple(2)
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, lewei_scale=1.0, base_size=16):
+    if isinstance(grid_size, int):
+        grid_size = to_2tuple(grid_size)
+
+    grid_h = (
+        np.arange(grid_size[0], dtype=np.float32)
+        / (grid_size[0] / base_size)
+        / lewei_scale
+    )
+    grid_w = (
+        np.arange(grid_size[1], dtype=np.float32)
+        / (grid_size[1] / base_size)
+        / lewei_scale
+    )
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+    grid = grid.reshape([2, 1, grid_size[1], grid_size[0]])
+
+    pos_embed = get_2d_sincos_embed_from_grid(embed_dim, grid)
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate(
+            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0
+        )
+    return pos_embed

@@ -1,9 +1,9 @@
-import torch, math
+import torch, math, xformers
 from torch import nn
 from torch.nn import functional as func_nn
 import numpy as np
 from transformers import AutoTokenizer, T5EncoderModel
-from timm.models.vision_transformer import Mlp, DropPath
+from timm.models.vision_transformer import Mlp, DropPath, Attention
 from einops import rearrange
 from typing import TypeAlias
 from minified.utils import config
@@ -125,41 +125,99 @@ class SelfAttention(nn.Module):
 class CrossAttention(nn.Module):
     def __init__(self, n_heads=config.attn_heads, embed_dim=config.embed_dim, cross_dim=120, drop_rate=0.1):
         super().__init__()
-        
+
         self.attn_heads = n_heads
         self.embed_dim = embed_dim
         self.head_dim = embed_dim // n_heads
-        
+
         self.q_linear = nn.Linear(embed_dim, embed_dim, bias=True)
         self.k_linear = nn.Linear(cross_dim, embed_dim, bias=True)
         self.v_linear = nn.Linear(cross_dim, embed_dim, bias=True)
-        
+
         self.output_project = nn.Linear(embed_dim, embed_dim)
-        
+
         self.dropout = nn.Dropout(drop_rate)
-        
+
     def forward(self, x_input: torch.Tensor, y_cond: torch.Tensor):
-                
+
         # get query for iput, key/value vectors fror conditions
         q = self.q_linear(x_input)
         k = self.k_linear(y_cond)
         v = self.v_linear(y_cond)
-        
+
         # unfold tensors for attention computation
         # b - batch, n - sequence length, h - attn heads, e - embed_dim
         q = rearrange(q, 'b n (h e) -> b h n e', h=self.attn_heads) 
         k = rearrange(k, 'b n (h e) -> b h n e', h=self.attn_heads) 
         v = rearrange(v, 'b n (h e) -> b h n e', h=self.attn_heads) 
-        
+
         # attention computatation
         attn_weight = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # dot product of query/keys, divide by root of head di
         attn_score = func_nn.softmax(attn_weight, dim=1) # calculate softmax (squeeze into range(0, 1))
         output = attn_score @ v # multiply with value vectors
-        
+
         output = rearrange(output, 'b h n e -> b n (h e)') # fold back to input shape
         output = self.output_project(output) # output projection
-        
+
         return output
+
+
+# copied from official impl
+class WindowAttention(Attention):
+    """Multi-head Attention block with relative position embeddings."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=config.attn_heads,
+        qkv_bias=True,
+        use_rel_pos=False,
+        rel_pos_zero_init=True,
+        input_size=None,
+        **block_kwargs,
+    ):
+        super().__init__(dim, num_heads=num_heads, qkv_bias=qkv_bias, **block_kwargs)
+
+        self.use_rel_pos = use_rel_pos
+        if self.use_rel_pos:
+            # initialize relative positional embeddings
+            self.rel_pos_h = nn.Parameter(
+                torch.zeros(2 * input_size[0] - 1, self.head_dim)
+            )
+            self.rel_pos_w = nn.Parameter(
+                torch.zeros(2 * input_size[1] - 1, self.head_dim)
+            )
+
+            if not rel_pos_zero_init:
+                nn.init.trunc_normal_(self.rel_pos_h, std=0.02)
+                nn.init.trunc_normal_(self.rel_pos_w, std=0.02)
+
+    def forward(self, x, mask=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = qkv.unbind(2)
+        if use_fp32_attention := getattr(self, "fp32_attention", False):
+            q, k, v = q.float(), k.float(), v.float()
+
+        attn_bias = None
+        if mask is not None:
+            attn_bias = torch.zeros(
+                [B * self.num_heads, q.shape[1], k.shape[1]],
+                dtype=q.dtype,
+                device=q.device,
+            )
+            attn_bias.masked_fill_(
+                mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float("-inf")
+            )
+        x = xformers.ops.memory_efficient_attention(
+            q, k, v, p=self.attn_drop.p, attn_bias=attn_bias
+        )
+
+        x = x.view(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
 
 
 class FinalLayer(nn.Module):

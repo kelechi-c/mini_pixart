@@ -2,7 +2,6 @@ import torch, math, xformers
 from torch import nn
 from torch.nn import functional as func_nn
 import numpy as np
-from transformers import AutoTokenizer, T5EncoderModel
 from timm.models.vision_transformer import Mlp, DropPath, Attention
 from einops import rearrange
 from typing import TypeAlias
@@ -10,19 +9,7 @@ from minified.utils import config
 from collections.abc import Iterable
 from itertools import repeat
 
-
 tensor: TypeAlias = torch.Tensor # alias typing for torch.Tensor
-
-# T5 text encoder
-t5_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-t5_model = T5EncoderModel.from_pretrained("google-t5/t5-small")
-
-def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
-    input_ids = tokenizer(text_input, return_tensors="pt").input_ids  # Batch size 1
-    outputs = model(input_ids=input_ids)
-    last_hidden_states = outputs.last_hidden_state
-
-    return last_hidden_states
 
 def modulate_t2i(x, scale, shift):
     return x * (1 + scale) + shift
